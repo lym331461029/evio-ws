@@ -7,10 +7,8 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
-	"strings"
-
 	"github.com/tidwall/evio"
+	"log"
 )
 
 func main() {
@@ -42,9 +40,11 @@ func main() {
 		return
 	}
 	events.Data = func(c evio.Conn, in []byte) (out []byte, action evio.Action) {
-		if trace {
-			log.Printf("%s", strings.TrimSpace(string(in)))
-		}
+		log.Printf("recv: %s", string(in))
+
+		//if trace {
+		//	log.Printf("%s", strings.TrimSpace(string(in)))
+		//}
 		out = in
 		return
 	}

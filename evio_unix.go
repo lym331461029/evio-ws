@@ -2,12 +2,18 @@
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
 
+//go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
 // +build darwin netbsd freebsd openbsd dragonfly linux
 
 package evio
 
 import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"github.com/gobwas/ws/wsutil"
 	"io"
+	"log"
 	"net"
 	"os"
 	"runtime"
@@ -18,12 +24,14 @@ import (
 
 	reuseport "github.com/kavu/go_reuseport"
 	"github.com/tidwall/evio/internal"
+
+	ws "github.com/gobwas/ws"
 )
 
 type conn struct {
-	fd         int              // file descriptor
-	lnidx      int              // listener index in the server lns list
-	out        []byte           // write buffer
+	fd    int // file descriptor
+	lnidx int // listener index in the server lns list
+	//out        []byte           // write buffer
 	sa         syscall.Sockaddr // remote socket address
 	reuse      bool             // should reuse input buffer
 	opened     bool             // connection opened event fired
@@ -33,6 +41,10 @@ type conn struct {
 	localAddr  net.Addr         // local addre
 	remoteAddr net.Addr         // remote addr
 	loop       *loop            // connected loop
+
+	upgraded bool          //是否已经协议升级
+	outBuf   *bytes.Buffer //
+	inBuf    *bytes.Buffer //
 }
 
 func (c *conn) Context() interface{}       { return c.ctx }
@@ -44,6 +56,14 @@ func (c *conn) Wake() {
 	if c.loop != nil {
 		c.loop.poll.Trigger(c)
 	}
+}
+
+func (c *conn) Read(p []byte) (n int, err error) {
+	return c.inBuf.Read(p)
+}
+
+func (c *conn) Write(p []byte) (n int, err error) {
+	return c.outBuf.Write(p)
 }
 
 type server struct {
@@ -236,8 +256,13 @@ func loopRun(s *server, l *loop) {
 			return loopAccept(s, l, fd)
 		case !c.opened:
 			return loopOpened(s, l, c)
-		case len(c.out) > 0:
+		case !c.upgraded:
+			return loopUpgrade(s, l, c)
+		case c.outBuf.Len() > 0:
 			return loopWrite(s, l, c)
+
+		//case len(c.out) > 0:
+		//	return loopWrite(s, l, c)
 		case c.action != None:
 			return loopAction(s, l, c)
 		default:
@@ -291,9 +316,12 @@ func loopAccept(s *server, l *loop, fd int) error {
 				return err
 			}
 			c := &conn{fd: nfd, sa: sa, lnidx: i, loop: l}
-			c.out = nil
+			//c.out = nil
+			c.outBuf = bytes.NewBuffer(nil)
+			c.inBuf = bytes.NewBuffer(nil)
 			l.fdconns[c.fd] = c
 			l.poll.AddReadWrite(c.fd)
+			//l.poll.AddRead(c.fd) //websocket需要先等客户端连接
 			atomic.AddInt32(&l.count, 1)
 			break
 		}
@@ -348,11 +376,12 @@ func loopOpened(s *server, l *loop, c *conn) error {
 	c.localAddr = s.lns[c.lnidx].lnaddr
 	c.remoteAddr = internal.SockaddrToAddr(c.sa)
 	if s.events.Opened != nil {
-		out, opts, action := s.events.Opened(c)
-		if len(out) > 0 {
-			c.out = append([]byte{}, out...)
-		}
-		c.action = action
+		_, opts, _ := s.events.Opened(c)
+		//if len(out) > 0 {
+			//c.outBuf.Write(out) //websocket框架，服务端不因该先给客户端发数据
+			//c.out = append([]byte{}, out...)
+		//}
+		//c.action = action
 		c.reuse = opts.ReuseInputBuffer
 		if opts.TCPKeepAlive > 0 {
 			if _, ok := s.lns[c.lnidx].ln.(*net.TCPListener); ok {
@@ -360,9 +389,14 @@ func loopOpened(s *server, l *loop, c *conn) error {
 			}
 		}
 	}
-	if len(c.out) == 0 && c.action == None {
-		l.poll.ModRead(c.fd)
-	}
+
+	l.poll.ModRead(c.fd)
+	//if c.outBuf.Len() == 0 && c.action == None {
+	//	l.poll.ModRead(c.fd)
+	//}
+	//if len(c.out) == 0 && c.action == None {
+	//	l.poll.ModRead(c.fd)
+	//}
 	return nil
 }
 
@@ -370,27 +404,36 @@ func loopWrite(s *server, l *loop, c *conn) error {
 	if s.events.PreWrite != nil {
 		s.events.PreWrite()
 	}
-	n, err := syscall.Write(c.fd, c.out)
+	n, err := syscall.Write(c.fd, c.outBuf.Bytes())
 	if err != nil {
 		if err == syscall.EAGAIN {
 			return nil
 		}
 		return loopCloseConn(s, l, c, err)
 	}
-	if n == len(c.out) {
-		// release the connection output page if it goes over page size,
-		// otherwise keep reusing existing page.
-		if cap(c.out) > 4096 {
-			c.out = nil
-		} else {
-			c.out = c.out[:0]
-		}
+	if n == c.outBuf.Len() {
+		c.outBuf.Reset()
 	} else {
-		c.out = c.out[n:]
+		c.outBuf.Next(n)
 	}
-	if len(c.out) == 0 && c.action == None {
+
+	if c.outBuf.Len() == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
+	//if n == len(c.out) {
+	//	// release the connection output page if it goes over page size,
+	//	// otherwise keep reusing existing page.
+	//	if cap(c.out) > 4096 {
+	//		c.out = nil
+	//	} else {
+	//		c.out = c.out[:0]
+	//	}
+	//} else {
+	//	c.out = c.out[n:]
+	//}
+	//if len(c.out) == 0 && c.action == None {
+	//	l.poll.ModRead(c.fd)
+	//}
 	return nil
 }
 
@@ -405,9 +448,13 @@ func loopAction(s *server, l *loop, c *conn) error {
 	case Detach:
 		return loopDetachConn(s, l, c, nil)
 	}
-	if len(c.out) == 0 && c.action == None {
+
+	if c.outBuf.Len() == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
+	//if len(c.out) == 0 && c.action == None {
+	//	l.poll.ModRead(c.fd)
+	//}
 	return nil
 }
 
@@ -418,9 +465,39 @@ func loopWake(s *server, l *loop, c *conn) error {
 	out, action := s.events.Data(c, nil)
 	c.action = action
 	if len(out) > 0 {
-		c.out = append([]byte{}, out...)
+		//c.out = append([]byte{}, out...)
+		c.outBuf.Write(out)
 	}
-	if len(c.out) != 0 || c.action != None {
+	if c.outBuf.Len() > 0 || c.action != None {
+		l.poll.ModReadWrite(c.fd)
+	}
+	//if len(c.out) != 0 || c.action != None {
+	//	l.poll.ModReadWrite(c.fd)
+	//}
+	return nil
+}
+
+func loopUpgrade(s *server, l *loop, c *conn) error {
+	var in []byte
+	n, err := syscall.Read(c.fd, l.packet)
+	if n == 0 || err != nil {
+		if err == syscall.EAGAIN {
+			return nil
+		}
+		return loopCloseConn(s, l, c, err)
+	}
+	in = l.packet[:n]
+	c.inBuf.Write(in)
+
+	_, err = ws.DefaultUpgrader.Upgrade(c)
+	if err != nil {
+		return loopCloseConn(s, l, c, err)
+	}
+	c.upgraded = true
+
+	//fmt.Println(hs)
+
+	if c.outBuf.Len() > 0 {
 		l.poll.ModReadWrite(c.fd)
 	}
 	return nil
@@ -436,19 +513,96 @@ func loopRead(s *server, l *loop, c *conn) error {
 		return loopCloseConn(s, l, c, err)
 	}
 	in = l.packet[:n]
-	if !c.reuse {
-		in = append([]byte{}, in...)
-	}
-	if s.events.Data != nil {
-		out, action := s.events.Data(c, in)
-		c.action = action
-		if len(out) > 0 {
-			c.out = append(c.out[:0], out...)
+	c.inBuf.Write(in)
+	//if !c.reuse {
+	//	in = append([]byte{}, in...)
+	//}
+
+	length, err := preCheckFrameLength(c.inBuf.Bytes())
+	if err != nil {
+		if err == errNotEnoughData {
+			return nil
+		} else {
+			return loopCloseConn(s, l, c, err)
 		}
 	}
-	if len(c.out) != 0 || c.action != None {
+
+	frame, _ := ws.ReadFrame(c)
+	c.inBuf.Next(int(length)) // offset前进
+
+	if frame.Header.Masked {
+		frame = ws.UnmaskFrame(frame)
+	}
+
+	if frame.Header.OpCode.IsControl() {
+		err := wsutil.HandleClientControlMessage(c, wsutil.Message{
+			OpCode:  frame.Header.OpCode,
+			Payload: frame.Payload,
+		})
+
+		if err != nil {
+			log.Printf("handle control error: %v", err)
+			return loopCloseConn(s, l, c, err)
+		}
+	} else if s.events.Data != nil {
+		out, action := s.events.Data(c, frame.Payload) //此处要处理未处理完的情况
+		c.action = action
+		if len(out) > 0 {
+			err = wsutil.WriteServerMessage(c, frame.Header.OpCode, out)
+			if err != nil {
+				return loopCloseConn(s, l, c, err)
+			}
+		}
+	}
+
+	//msg := make([]wsutil.Message, 0, 4)
+	//
+	//for {
+	//	msg, err = wsutil.ReadClientMessage(c, msg[:0])
+	//	if err != nil {
+	//		log.Printf("read message error: %v", err)
+	//		return loopCloseConn(s, l, c, err)
+	//	}
+	//	for _, m := range msg {
+	//		if m.OpCode.IsControl() {
+	//			err := wsutil.HandleClientControlMessage(c, m)
+	//			if err != nil {
+	//				log.Printf("handle control error: %v", err)
+	//				return loopCloseConn(s, l, c, err)
+	//			}
+	//			continue
+	//		}
+	//
+	//		if s.events.Data != nil {
+	//			out, action := s.events.Data(c, m.Payload)
+	//		}
+	//		err := wsutil.WriteServerMessage(conn, m.OpCode, m.Payload)
+	//		if err != nil {
+	//			log.Printf("write message error: %v", err)
+	//			return
+	//		}
+	//	}
+	//}
+
+	//if s.events.Data != nil {
+	//	out, action := s.events.Data(c, c.inBuf.Bytes()) //此处要处理未处理完的情况
+	//	c.action = action
+	//	if len(out) > 0 {
+	//		c.outBuf.Write(out)
+	//	}
+	//	//out, action := s.events.Data(c, in)
+	//	//c.action = action
+	//	//if len(out) > 0 {
+	//	//	c.out = append(c.out[:0], out...)
+	//	//}
+	//}
+
+	if c.outBuf.Len() > 0 || c.action != None {
 		l.poll.ModReadWrite(c.fd)
 	}
+	//if len(c.out) != 0 || c.action != None {
+	//	l.poll.ModReadWrite(c.fd)
+	//}
 	return nil
 }
 
@@ -538,4 +692,58 @@ func reuseportListenPacket(proto, addr string) (l net.PacketConn, err error) {
 
 func reuseportListen(proto, addr string) (l net.Listener, err error) {
 	return reuseport.Listen(proto, addr)
+}
+
+var errNotEnoughData = fmt.Errorf("Not Enough Data")
+
+func preCheckFrameLength(data []byte) (l int64, err error) {
+	if len(data) < 2 {
+		return 0, errNotEnoughData
+	}
+
+	var h ws.Header
+	var extra int
+
+	if data[1]&0x80 != 0 {
+		h.Masked = true
+		extra += 4
+	}
+
+	length := data[1] & 0x7f
+	switch {
+	case length < 126:
+		h.Length = int64(length)
+
+	case length == 126:
+		extra += 2
+
+	case length == 127:
+		extra += 8
+
+	default:
+		err = ws.ErrHeaderLengthUnexpected
+		return
+	}
+
+	if len(data) < 2+extra {
+		return 0, errNotEnoughData
+	}
+
+	switch {
+	case length == 126:
+		h.Length = int64(binary.BigEndian.Uint16(data[2:4]))
+
+	case length == 127:
+		//if bts[0]&0x80 != 0 {
+		//	err = ErrHeaderLengthMSB
+		//	return
+		//}
+		h.Length = int64(binary.BigEndian.Uint64(data[2:10]))
+	}
+
+	l = 2 + int64(extra) + h.Length
+	if len(data) < int(l) {
+		return l, errNotEnoughData
+	}
+	return
 }
